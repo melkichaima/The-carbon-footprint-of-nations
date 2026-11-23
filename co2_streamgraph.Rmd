@@ -1,0 +1,1114 @@
+---
+title: "The Human Smokestack: CO₂ Emissions, 1750–2025"
+subtitle: "Statistical reasoning and computational creativity with the Our World in Data CO₂ dataset"
+author: "Your name(s) here"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: false
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                       fig.align = "center", fig.width = 10, fig.height = 5.5)
+Sys.setlocale("LC_ALL", "C.UTF-8")  # so CO₂'s subscript and en dashes render
+library(tidyverse)   # readr, dplyr, tidyr, ggplot2, stringr, purrr, tibble
+library(broom)       # tidy model output
+library(scales)
+library(knitr)
+```
+
+# 1. The story
+
+Almost all of the CO₂ humans have put into the air came from a small number
+of countries, over a short stretch of time, and the warming it causes
+tracks that running total closely. This document tells that story in three steps:
+
+1. **Analysis (Part 2).** A standard tidyverse pipeline (import, inspect,
+   tidy, transform, visualise, model) asks four questions of the data. How
+   fast have emissions grown? What were they made of? Who emitted them? How
+   unequal are emissions per person today? And how closely does warming
+   follow the cumulative total?
+2. **Artwork for the eye (Part 3).** *The Human Smokestack* is a streamgraph
+   that pours out of a factory chimney and widens as the world industrialises.
+   Each band is a region and each band ends in its own totals.
+3. **Artwork for the ear (Part 4).** *Breath of the Chimney* is a 26-second
+   sonification of 1850–2025. The smoke is noise that grows louder, the three
+   largest emitters are a chord, and the warming is a drone that rises in
+   pitch.
+
+Part 5 uses the two artworks to answer the assignment's two questions.
+
+# 2. Analysis: the data science pipeline
+
+## 2.1 Import
+
+The data is Our World in Data's CO₂ and Greenhouse Gas Emissions dataset
+(<https://github.com/owid/co2-data>). This document reads the copy of
+`owid-co2-data.csv` saved next to it. If that file is missing, it reads the
+latest version from GitHub instead.
+
+```{r import}
+csv_path <- if (file.exists("owid-co2-data.csv")) "owid-co2-data.csv" else
+  "https://raw.githubusercontent.com/owid/co2-data/master/owid-co2-data.csv"
+co2 <- read_csv(csv_path, show_col_types = FALSE)
+
+dim(co2)            # rows x columns
+range(co2$year)     # time span covered
+```
+
+## 2.2 Inspect
+
+Each row is one country or region in one year, with
+`r ncol(co2)` columns. The columns used in this document are:
+
+```{r inspect}
+co2 %>%
+  select(country, year, iso_code, population, co2, coal_co2, oil_co2,
+         gas_co2, cement_co2, flaring_co2, other_industry_co2,
+         cumulative_co2, cumulative_co2_including_luc,
+         temperature_change_from_co2) %>%
+  glimpse()
+
+# how complete is the World series for each column we rely on?
+co2 %>%
+  filter(country == "World") %>%
+  summarise(across(c(co2, coal_co2, oil_co2, gas_co2, cement_co2, flaring_co2,
+                     cumulative_co2_including_luc, temperature_change_from_co2),
+                   ~ paste(range(year[!is.na(.x)]), collapse = "–"))) %>%
+  pivot_longer(everything(), names_to = "column", values_to = "years with data") %>%
+  kable()
+```
+
+All emissions are in **million tonnes of CO₂ (Mt)**. The `co2` column counts
+fossil fuels and industry only. Land-use change, such as deforestation, is
+counted separately.
+
+## 2.3 Tidy
+
+The file mixes real countries with aggregates such as "World", "Africa",
+"European Union (27)" and income groups. Adding them together would double
+count. Countries have a three-letter ISO code. Aggregates have either no
+code or an `OWID_` code, so the two can be separated cleanly.
+
+```{r tidy}
+countries <- co2 %>%
+  filter(!is.na(iso_code), !str_starts(iso_code, "OWID"))
+world <- co2 %>% filter(country == "World")
+last_year <- max(world$year[!is.na(world$co2)])
+
+n_distinct(countries$country)   # number of countries
+last_year
+
+# the six fossil/industrial sources, from wide columns to one long column
+source_cols <- c(Coal = "coal_co2", Oil = "oil_co2", Gas = "gas_co2",
+                 Cement = "cement_co2", Flaring = "flaring_co2",
+                 Other = "other_industry_co2")
+world_sources <- world %>%
+  select(year, co2, all_of(source_cols)) %>%
+  pivot_longer(-c(year, co2), names_to = "source", values_to = "mt") %>%
+  # a missing source before it existed (oil before 1855, flaring before
+  # 1950, ...) means no emissions from it, so 0
+  mutate(mt = replace_na(mt, 0),
+         source = factor(source, levels = names(source_cols)))
+
+# sanity check: the six sources add up to the total in every year
+world_sources %>%
+  group_by(year, co2) %>%
+  summarise(sum_sources = sum(mt), .groups = "drop") %>%
+  summarise(largest_gap_mt = max(abs(sum_sources - co2)))
+```
+
+The six sources add up to the total to within a rounding error in every
+year, so the long table is safe to stack.
+
+## 2.4 How fast did emissions grow, and from what?
+
+```{r sources-plot, fig.cap="World CO₂ emissions from fossil fuels and industry by source, 1750–2025"}
+source_colors <- c(Coal = "#3b3b3b", Oil = "#8c5a2b", Gas = "#4a7fb0",
+                   Cement = "#b8b2a6", Flaring = "#e07b39", Other = "#9a7fb8")
+
+ggplot(world_sources, aes(year, mt / 1000, fill = source)) +
+  geom_area(color = NA) +
+  scale_fill_manual(values = source_colors, name = NULL) +
+  scale_x_continuous(breaks = seq(1750, 2025, by = 25), expand = c(0, 0)) +
+  scale_y_continuous(labels = label_number(suffix = " bn t"), expand = expansion(mult = c(0, 0.05))) +
+  labs(x = NULL, y = NULL,
+       title = "World CO₂ emissions by source",
+       subtitle = "Billion tonnes per year, fossil fuels and industry") +
+  theme_minimal(base_size = 13) +
+  theme(panel.grid.minor = element_blank(), legend.position = "top")
+```
+
+```{r source-shares}
+first_last <- world_sources %>%
+  filter(year %in% c(1900, 1950, last_year)) %>%
+  group_by(year) %>%
+  mutate(share = mt / sum(mt)) %>%
+  ungroup() %>%
+  select(year, source, share) %>%
+  pivot_wider(names_from = year, values_from = share)
+first_last %>% mutate(across(-source, percent_format(accuracy = 0.1))) %>% kable()
+```
+
+Coal was almost the whole story until 1900. Oil and gas only became major
+sources after 1950, and coal is still the largest single source in
+`r last_year`.
+
+To measure growth, a model of the form `log(co2) ~ year` is fitted to each
+historical period. The slope of that line is the average yearly growth
+rate, and `log(2) / slope` is the doubling time.
+
+```{r growth}
+periods <- tribble(
+  ~period,                  ~from, ~to,
+  "Industrial take-off",     1850, 1913,
+  "Wars and depression",     1914, 1945,
+  "Post-war boom",           1946, 1973,
+  "Oil shocks to 2000",      1974, 2000,
+  "21st century",            2001, last_year
+)
+
+growth <- periods %>%
+  mutate(fit = map2(from, to, ~ lm(log(co2) ~ year,
+                                   data = filter(world, year >= .x, year <= .y))),
+         tidied = map(fit, ~ tidy(.x, conf.int = TRUE) %>% filter(term == "year")),
+         r2 = map_dbl(fit, ~ glance(.x)$r.squared)) %>%
+  unnest(tidied) %>%
+  transmute(period, years = paste0(from, "–", to),
+            growth = exp(estimate) - 1,
+            ci_low = exp(conf.low) - 1, ci_high = exp(conf.high) - 1,
+            doubling_years = log(2) / estimate, r2)
+
+growth %>%
+  mutate(across(c(growth, ci_low, ci_high), percent_format(accuracy = 0.1)),
+         doubling_years = round(doubling_years),
+         r2 = round(r2, 3)) %>%
+  kable(col.names = c("Period", "Years", "Growth / yr", "95% CI low",
+                      "95% CI high", "Doubling time (yrs)", "R²"))
+```
+
+```{r growth-values, include=FALSE}
+growth_of   <- function(p) growth$growth[growth$period == p]
+doubling_of <- function(p) round(growth$doubling_years[growth$period == p])
+```
+
+There were two bursts of very fast growth. From 1850 to 1913 emissions grew
+about `r percent(growth_of("Industrial take-off"), 0.1)` a year, doubling every
+`r doubling_of("Industrial take-off")` years, and the post-war boom matched it at
+`r percent(growth_of("Post-war boom"), 0.1)`. Since the 1970s growth has slowed to
+about `r percent(growth_of("21st century"), 0.1)` a year. That is slower growth, but
+not a decline: on top of today's base it still adds hundreds of millions of
+tonnes every year.
+
+The confidence intervals assume each year is independent of the next.
+Emissions series are strongly autocorrelated, so the true uncertainty is
+wider than shown. The point estimates are the part to rely on.
+
+## 2.5 Who emitted it?
+
+```{r top10, fig.height=5, fig.cap="The ten countries with the largest cumulative CO₂ emissions, 1750–2025"}
+top10 <- countries %>%
+  filter(year == last_year) %>%
+  slice_max(cumulative_co2, n = 10) %>%
+  mutate(country = fct_reorder(country, cumulative_co2))
+
+top10_share <- sum(top10$share_global_cumulative_co2) / 100
+
+ggplot(top10, aes(cumulative_co2 / 1000, country)) +
+  geom_col(fill = "#6b4a2f", width = 0.7) +
+  geom_text(aes(label = paste0(round(share_global_cumulative_co2, 1), "%")),
+            hjust = -0.15, size = 3.8, color = "#2b2b2b") +
+  scale_x_continuous(labels = label_number(suffix = " bn t"),
+                     expand = expansion(mult = c(0, 0.12))) +
+  labs(x = NULL, y = NULL,
+       title = paste0("Cumulative CO₂ emissions, 1750–", last_year),
+       subtitle = "Labels show each country's share of the world's cumulative total") +
+  theme_minimal(base_size = 13) +
+  theme(panel.grid.major.y = element_blank(), panel.grid.minor = element_blank())
+```
+
+Ten of the `r n_distinct(countries$country)` countries account for
+`r percent(top10_share, 1)` of all fossil CO₂ emitted since 1750. The United
+States alone accounts for
+`r percent(top10$share_global_cumulative_co2[top10$country == "United States"] / 100, 0.1)`.
+
+## 2.6 How unequal is it today?
+
+A Lorenz curve answers this question. It ranks countries from lowest to
+highest emissions per person, then plots each group's share of the world's
+population against its share of the world's emissions. The further the curve
+sags below the diagonal, the more unequal emissions are. The Gini
+coefficient summarises the sag in one number: 0 means everyone emits the
+same, and 1 means one person emits everything.
+
+```{r lorenz, fig.width=7, fig.height=6.5, fig.cap="Lorenz curve of national per-person CO₂ emissions"}
+ineq <- countries %>%
+  filter(year == last_year, !is.na(co2), !is.na(population), population > 0) %>%
+  mutate(per_capita = co2 / population) %>%
+  arrange(per_capita) %>%
+  mutate(pop_share = cumsum(population) / sum(population),
+         em_share  = cumsum(co2) / sum(co2))
+
+lorenz <- bind_rows(tibble(pop_share = 0, em_share = 0),
+                    select(ineq, pop_share, em_share))
+gini <- 1 - sum(diff(lorenz$pop_share) *
+                (head(lorenz$em_share, -1) + tail(lorenz$em_share, -1)))
+bottom50 <- approx(lorenz$pop_share, lorenz$em_share, xout = 0.5)$y
+top10pop <- 1 - approx(lorenz$pop_share, lorenz$em_share, xout = 0.9)$y
+
+ggplot(lorenz, aes(pop_share, em_share)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "22", color = "#9a968e") +
+  geom_line(linewidth = 1.1, color = "#9c1f4a") +
+  annotate("point", x = 0.5, y = bottom50, size = 3, color = "#9c1f4a") +
+  annotate("text", x = 0.52, y = bottom50 - 0.03, hjust = 0, vjust = 1, size = 4,
+           label = paste0("The lowest-emitting half of humanity\nemits ",
+                          percent(bottom50, 1), " of the CO₂")) +
+  annotate("text", x = 0.55, y = 0.62, angle = 45, size = 3.6, color = "#9a968e",
+           label = "perfect equality") +
+  scale_x_continuous(labels = percent, expand = c(0, 0.01)) +
+  scale_y_continuous(labels = percent, expand = c(0, 0.01)) +
+  coord_equal() +
+  labs(x = "Share of world population (lowest per-person emitters first)",
+       y = "Share of world CO₂ emissions",
+       title = paste0("Who emits, ", last_year),
+       subtitle = paste0(nrow(ineq), " countries · Gini = ", round(gini, 2))) +
+  theme_minimal(base_size = 13) +
+  theme(panel.grid.minor = element_blank())
+```
+
+In `r last_year`, the countries that hold the lowest-emitting half of the
+world's population emitted only `r percent(bottom50, 1)` of the CO₂. The
+highest-emitting tenth emitted `r percent(top10pop, 1)`. This calculation
+treats every person in a country as emitting that country's average. It
+cannot see inequality between people within the same country, so the true
+inequality between individuals is higher than this Gini of `r round(gini, 2)`
+suggests.
+
+## 2.7 From emissions to warming
+
+If the human contribution drives warming, warming should follow the
+cumulative total of CO₂ emitted, not each year's emissions. This chunk
+regresses the dataset's estimate of global warming caused by CO₂ on the
+world's cumulative CO₂, including land-use change, for every year from 1851
+to 2024.
+
+```{r warming, fig.width=9, fig.height=5.5, fig.cap="Estimated warming from CO₂ against cumulative CO₂ emitted, 1851–2024"}
+warm <- world %>%
+  filter(!is.na(temperature_change_from_co2), !is.na(cumulative_co2_including_luc)) %>%
+  mutate(cum_gt = cumulative_co2_including_luc / 1000)   # billion tonnes
+
+warm_fit <- lm(temperature_change_from_co2 ~ cum_gt, data = warm)
+tidy(warm_fit, conf.int = TRUE) %>% kable(digits = 6)
+glance(warm_fit) %>% select(r.squared, sigma, nobs) %>% kable(digits = 5)
+
+per_1000 <- coef(warm_fit)[["cum_gt"]] * 1000   # °C per 1,000 billion tonnes
+
+ggplot(warm, aes(cum_gt, temperature_change_from_co2, color = year)) +
+  geom_point(size = 1.8) +
+  geom_smooth(method = "lm", se = FALSE, color = "#2b2b2b", linewidth = 0.6,
+              linetype = "22") +
+  scale_color_viridis_c(option = "inferno", end = 0.9, name = NULL) +
+  scale_x_continuous(labels = label_number(big.mark = ",", suffix = " bn t")) +
+  scale_y_continuous(labels = label_number(suffix = " °C")) +
+  annotate("text", x = 300, y = 1.05, hjust = 0, size = 4.2,
+           label = paste0("≈ ", round(per_1000, 2), " °C of warming\nper 1,000 billion tonnes emitted")) +
+  labs(x = "Cumulative CO₂ emitted since 1850 (including land-use change)",
+       y = "Global warming caused by CO₂",
+       title = "Warming tracks the running total of emissions") +
+  theme_minimal(base_size = 13) +
+  theme(panel.grid.minor = element_blank())
+```
+
+The relationship is almost perfectly straight (R² =
+`r round(glance(warm_fit)$r.squared, 4)`). Each 1,000 billion tonnes of CO₂
+adds about **`r round(per_1000, 2)` °C** of warming. This matches the IPCC's
+best estimate of about 0.45 °C per 1,000 billion tonnes, its "transient
+climate response to cumulative emissions". By `r max(warm$year)` humans had
+emitted `r comma(round(max(warm$cum_gt)))` billion tonnes, which by this
+relationship accounts for about `r round(max(warm$temperature_change_from_co2), 2)` °C
+of warming.
+
+The near-perfect R² needs care. OWID did not measure this temperature
+column with thermometers. It estimated it from emissions with a simple
+climate model, so a strong fit is partly built in. What the regression
+shows is that the dataset is internally consistent with established climate
+science. It does not prove that relationship independently. Observed warming
+also includes effects from methane, nitrous oxide and aerosols.
+
+# 3. Artwork for the eye: *The Human Smokestack*
+
+The first artwork turns sections 2.4 to 2.6 into a single image. A
+streamgraph pours out of a factory chimney in 1950 and keeps widening to `r last_year`.
+Each band is a region. Its thickness in any year is that
+region's emissions, and its numbers at the right edge are its `r last_year`
+emissions and its total since 1950. The chimney's smoke runs straight into
+the bands. The metaphor is that every band is smoke from the same stack, and
+the stack is human industry.
+
+The sections below build the artwork step by step.
+
+### 3.1 The time span and the series
+
+The artwork reuses the `co2` table imported in Part 2. It starts in 1950,
+when every region has a recorded value in every year, and runs to the last
+year in the file.
+
+```{r art-series}
+# the full range of the dataset: first to last year with a World figure
+Y0 <- 1950   # chart start (the dataset itself starts in 1750)
+Y1 <- max(co2$year[co2$country == "World" & !is.na(co2$co2)])
+
+# when each series used below starts and ends in the file
+sources <- c("United Kingdom", "European Union (27)", "United States", "China",
+             "India", "Russia", "Japan", "Canada", "Africa", "South America",
+             "Asia", "World")
+coverage <- co2 %>%
+  filter(country %in% sources, !is.na(co2)) %>%
+  group_by(country) %>%
+  summarise(first = min(year), last = max(year), .groups = "drop") %>%
+  arrange(first)
+coverage
+
+# one country/region's annual CO2 (Mt) for every year Y0..Y1.
+# Before a series' first recorded year it has no recorded emissions, so 0;
+# the occasional missing year inside a series is filled in linearly
+# from the years either side.
+get_series <- function(name) {
+  d <- co2 %>% filter(country == name, year >= Y0, year <= Y1, !is.na(co2))
+  v <- approx(d$year, d$co2, xout = Y0:Y1, rule = 1)$y
+  v[Y0:Y1 < min(d$year)] <- 0
+  v
+}
+```
+
+### 3.2 Building the twelve categories
+
+The chart follows the same regional breakdown a lot of "CO2 through time"
+explainers use: seven individual countries (the UK included, since it is the whole story
+before 1800), the EU-27 as a bloc, two continental
+aggregates, and two remainder categories so everything still sums to the real
+world total in every single year.
+
+```{r categories}
+china  <- get_series("China")
+us     <- get_series("United States")
+india  <- get_series("India")
+russia <- get_series("Russia")
+japan  <- get_series("Japan")
+canada <- get_series("Canada")
+uk     <- get_series("United Kingdom")
+eu     <- get_series("European Union (27)")   # OWID's own current-members aggregate
+africa <- get_series("Africa")                 # OWID continent aggregate
+sam    <- get_series("South America")          # OWID continent aggregate
+asia   <- get_series("Asia")                   # OWID continent aggregate
+world_v <- get_series("World")
+
+# Asia minus the three Asian countries already broken out on their own
+asia_excl <- asia - china - india - japan
+
+# whatever is left once every named category is subtracted from the world
+# total (Oceania, non-EU Europe, the rest of the Americas, etc.)
+named_sum <- china + us + india + russia + japan + canada + uk + eu + africa + sam + asia_excl
+rest_of_world <- world_v - named_sum
+
+# OWID's aggregates and country series come from slightly different sources
+# in the earliest years, so the remainder can dip a hair below zero there.
+# Check it is negligible, then clip it.
+stopifnot(min(rest_of_world) > -0.02 * max(world_v))
+rest_of_world <- pmax(rest_of_world, 0)
+
+years <- Y0:Y1
+
+# stacking order, bottom -> top
+order <- c("China", "Asia (excl. China, India, Japan)", "United States",
+           "European Union", "United Kingdom", "Rest of World", "India", "Russia",
+           "Africa", "South America", "Japan", "Canada")
+
+mat <- rbind(china, asia_excl, us, eu, uk, rest_of_world, india, russia, africa,
+             sam, japan, canada)
+rownames(mat) <- order
+n <- nrow(mat); m <- ncol(mat)
+```
+
+### 3.3 A wiggle-free "silhouette" streamgraph baseline
+
+A streamgraph is a stacked area chart whose baseline floats instead of
+sitting at zero, so the whole stack reads as a symmetric, organically
+expanding band rather than a wall rising off the x-axis. The classic
+ThemeRiver construction centers the stack at every year:
+
+```{r baseline}
+totals <- colSums(mat)
+baseline <- -totals / 2   # symmetric baseline: top = +total/2, bottom = -total/2
+
+ymin_mat <- matrix(0, n, m)
+ymax_mat <- matrix(0, n, m)
+cum <- baseline
+for (i in seq_len(n)) {
+  ymin_mat[i, ] <- cum
+  cum <- cum + mat[i, ]
+  ymax_mat[i, ] <- cum
+}
+rownames(ymin_mat) <- order
+rownames(ymax_mat) <- order
+
+long <- lapply(seq_len(n), function(i) {
+  tibble(year = years, category = order[i],
+         ymin = ymin_mat[i, ], ymax = ymax_mat[i, ], thickness = mat[i, ])
+}) %>%
+  bind_rows() %>%
+  mutate(category = factor(category, levels = order))
+```
+
+### 3.4 Colors, and automatic label contrast
+
+Each band keeps one fixed color. Rather than hand-pick a text color per
+label, we compute the [relative luminance](https://www.w3.org/TR/WCAG20/#relativeluminancedef)
+of each band's color and choose black or cream text automatically — this is
+what lets every country name sit *directly inside* its own colored band
+cleanly, instead of needing a separate legend.
+
+```{r colors}
+colors <- c(
+  "China" = "#9c1f4a", "Asia (excl. China, India, Japan)" = "#d98c82",
+  "United States" = "#1a6fa3", "European Union" = "#f2c230",
+  "United Kingdom" = "#6b4a2f",
+  "Rest of World" = "#a6a6a6", "India" = "#e2863a", "Russia" = "#2437d6",
+  "Africa" = "#1f6b3a", "South America" = "#8a3b8f", "Japan" = "#f3b8c4",
+  "Canada" = "#2f9e8f"
+)
+
+text_color_for <- function(hex) {
+  rgb <- col2rgb(hex) / 255
+  lin <- ifelse(rgb <= 0.03928, rgb / 12.92, ((rgb + 0.055) / 1.055)^2.4)
+  L <- 0.2126 * lin[1] + 0.7152 * lin[2] + 0.0722 * lin[3]
+  if (L > 0.45) "#1a1a1a" else "#f5f1e6"
+}
+label_colors <- setNames(vapply(colors, text_color_for, character(1)), names(colors))
+
+# A few band colors (pale pink, pale sand) work fine as fills but read poorly
+# as *text* against the cream page background. Darken just the text variant
+# for those — the ribbon, connector lines, and legend dots keep the true color.
+darken_label <- function(hex, amt = 0.35) {
+  rgb <- col2rgb(hex) / 255
+  if (mean(rgb) > 0.62) rgb <- rgb * (1 - amt)
+  rgb(rgb[1], rgb[2], rgb[3])
+}
+text_colors <- setNames(vapply(colors, darken_label, character(1)), names(colors))
+```
+
+### 3.5 Placing the labels: inside the band, or above it
+
+The names are set in one straight column near the right end of the stream
+(see the next section), each centered in its own band, the way the reference
+infographic does it. The helpers below are kept for the label search used
+elsewhere in the document.
+
+```{r label-placement}
+thin_categories <- c("Canada", "Japan", "South America")
+
+window_df <- long %>% filter(year >= 1995, year <= Y1 - 7)
+best <- window_df %>%
+  group_by(category) %>%
+  slice_max(thickness, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(mid = (ymin + ymax) / 2,
+         is_thin = category %in% thin_categories,
+         label = ifelse(category == "Asia (excl. China, India, Japan)",
+                         "Asia (excl. China,\nIndia, Japan)", as.character(category)))
+
+max_total <- max(totals)
+BG <- "#f5f1e6"  # warm off-white background, matches the reference infographic
+
+direct <- best %>% filter(!is_thin)
+
+pointer <- best %>%
+  filter(is_thin) %>%
+  mutate(year = c(Canada = 2019, Japan = 2011, `South America` = 1998)[as.character(category)]) %>%
+  rowwise() %>%
+  mutate(mid = {
+    i <- which(order == as.character(category))
+    j <- which(years == year)
+    (ymin_mat[i, j] + ymax_mat[i, j]) / 2
+  }) %>%
+  ungroup() %>%
+  mutate(label_y = max_total * 0.60)
+```
+
+### 3.6 Each band's numbers, attached to the end of the band
+
+Rather than a separate table that repeats every name, each region's numbers
+are written right where its band ends in `r Y1`, in the band's own color,
+set right against the band's end. The color and the position are the link. Both figures come straight out of
+`mat`: the last column for the `r Y1` value, `rowSums(mat)` for the
+`r Y0`–`r Y1` total, in billions of tonnes.
+
+```{r band-numbers}
+# Same y-envelope the plot uses (coord_cartesian below)
+ylim_lo <- -max_total * 0.66
+ylim_hi <- max_total * 0.74
+axis_y  <- ylim_lo + max_total * 0.015
+axis_ticks <- seq(Y0, Y1, by = 10)
+
+latest_val <- setNames(mat[, m] / 1000, order)      # billions of t, in Y1
+cum_val    <- setNames(rowSums(mat) / 1000, order)  # billions of t, Y0-Y1
+
+end_df <- tibble(
+  category = factor(order, levels = order),           # China (bottom) ... Canada (top)
+  target   = (ymin_mat[, m] + ymax_mat[, m]) / 2,     # middle of each band in Y1
+  v1       = latest_val[order],
+  v2       = cum_val[order],
+  col      = unname(colors[order]),
+  txt      = unname(text_colors[order])
+)
+
+# Each row sits level with its own band. Where thin bands are too close for
+# two lines of text, push rows upward just enough to clear each other; the
+# connector still starts at the band's true position.
+min_gap <- max_total * 0.021
+y <- end_df$target
+for (i in 2:length(y)) y[i] <- max(y[i], y[i - 1] + min_gap)
+end_df$y <- y
+
+num_v1 <- Y1 + 0.6     # this year's value, right against the band's end
+num_v2 <- Y1 + 5.0    # cumulative value
+div_x  <- Y1 + 4.4    # thin divider between the two columns
+head_y <- max(end_df$y) + min_gap * 2.2
+x_max  <- Y1 + 10
+
+# Names: one straight column, centered at name_x, each at the middle of its
+# own band in that year. Bands thick enough get the name inside (smaller type
+# for the thin ones); a band too thin for any text gets it just above.
+name_x <- 2014       # a flat stretch before the 2020 dip
+win <- which(years >= name_x - 4 & years <= name_x + 4)   # years the name text spans
+name_df <- tibble(
+  category = factor(order, levels = order),
+  label    = recode(order, "Asia (excl. China, India, Japan)" = "Asia\n(excl. China,\nIndia, Japan)",
+                    "Rest of World" = "Rest of\nWorld", "European Union" = "European\nUnion",
+                    "United Kingdom" = "U.K.",
+                    "United States" = "U.S."),
+  # average middle of the band across those years, so the name sits squarely
+  # in its own band even where the band slopes or dips (2020)
+  y        = rowMeans((ymin_mat[, win] + ymax_mat[, win]) / 2),
+  ymax     = apply(ymax_mat[, win], 1, max),
+  thick    = apply(mat[, win], 1, min),
+  col      = unname(colors[order]),
+  txt      = unname(text_colors[order])
+) %>%
+  mutate(inside = thick >= 800 & !category %in% c("South America", "United Kingdom"),
+         fs     = case_when(category == "Asia (excl. China, India, Japan)" ~ 3.9, thick >= 4000 ~ 4.6, thick >= 2500 ~ 4.0, thick >= 1300 ~ 3.0, TRUE ~ 2.7))
+
+# South America's name is too long for its thin band, and the U.K.'s band is
+# too thin for any text, so both get a pointer: the name above the stream and
+# a thin line down into the band
+make_pointer <- function(cat, yr, lab) {
+  i <- which(order == cat); j <- which(years == yr)
+  tibble(x = yr, label = lab,
+         y_mid = (ymin_mat[i, j] + ymax_mat[i, j]) / 2,
+         y_lab = totals[j] / 2 + max_total * 0.085,
+         col = colors[[cat]], txt = text_colors[[cat]])
+}
+sa_pointer <- bind_rows(make_pointer("South America", 1984, "South America"),
+                        make_pointer("United Kingdom", 2001, "United Kingdom"))
+```
+
+### 3.7 The three call-out facts (kept entirely off the colors)
+
+These sit in the blank cream background to either side of the thin early
+stream (1950s) — never on top of a colored band — with a thin leader line
+running from the text down (or up) to the data point it describes.
+
+```{r annotations}
+env_top <- function(yr) totals[years == yr] / 2
+env_bot <- function(yr) -totals[years == yr] / 2
+
+# Every number in the three call-outs is computed here from the data.
+total_over <- function(name, yrs) sum(co2$co2[co2$country == name & co2$year %in% yrs], na.rm = TRUE)
+
+# 1. the 1950s, and everything emitted before 1950 (1750-1949)
+fifties  <- 1950:1959
+before50 <- 1750:1949
+us_50s     <- total_over("United States", fifties) / total_over("World", fifties)
+europe_50s <- (total_over("European Union (27)", fifties) + total_over("United Kingdom", fifties)) /
+  total_over("World", fifties)
+west_pre50 <- (total_over("United States", before50) + total_over("European Union (27)", before50) +
+  total_over("United Kingdom", before50)) / total_over("World", before50)
+
+# 2. China, 1950 -> 1980
+china_1950   <- china[years == 1950]
+china_1980   <- china[years == 1980]
+china_growth <- round((china_1980 / china_1950 - 1) * 100)
+china_fold   <- round(china_1980 / china_1950)
+
+# 3. today: the three largest emitting countries, and the rest of Asia as a group
+top3_share <- (china[years == Y1] + us[years == Y1] + india[years == Y1]) / world_v[years == Y1]
+asia_share <- asia_excl[years == Y1] / world_v[years == Y1]
+
+# check that China, the U.S. and India really are the three largest countries
+countries_now <- co2 %>% filter(year == Y1, !is.na(iso_code), !str_starts(iso_code, "OWID"))
+stopifnot(identical(sort(slice_max(countries_now, co2, n = 3)$country),
+                    sort(c("China", "United States", "India"))))
+
+# a bracket under the text spanning the 1950s, with an arrow from it down
+# into the middle of the U.S. band in 1955
+us_mid_1955 <- long %>% filter(category == "United States", year == 1955) %>%
+  mutate(mid = (ymin + ymax) / 2) %>% pull(mid)
+ann1 <- list(x = 1952, y = 12200,
+             bracket_x = c(1950, 1959), bracket_y = 9000,
+             arrow_x = 1955, arrow_yend = us_mid_1955,
+             label = sprintf(paste0("In the 1950s, the U.S. and Europe (EU-27 + U.K.)\n",
+                                    "emitted %s of the world's CO\u2082."),
+                             percent(us_50s + europe_50s, 1)))
+
+ann2 <- list(x = 1952, y = -13600, xstart = 1961, ystart = -12900,
+             xend = 1969, yend = env_bot(1969) * 1.03,
+             label = sprintf(paste0("Between 1950 and 1980, China's yearly emissions grew\n",
+                                    "%s-fold (+%s%%), from %s to %s billion tonnes."),
+                             china_fold, format(china_growth, big.mark = ""),
+                             round(china_1950 / 1000, 2), round(china_1980 / 1000, 1)))
+
+ann3 <- list(x = 1952, y = -18600,
+             label = sprintf(paste0("Today, three countries (China, the U.S. and India)\n",
+                                    "emit %s of the world's CO\u2082. The rest of Asia,\n",
+                                    "taken together, emits another %s."),
+                             percent(top3_share, 1), percent(asia_share, 1)))
+
+# 4. the line under the title: what came before the chart starts
+pre_years   <- min(co2$year[co2$country == "World" & !is.na(co2$co2)]):(Y0 - 1)
+all_years   <- min(pre_years):Y1
+pre_total   <- total_over("World", pre_years)
+pre_share   <- pre_total / total_over("World", all_years)
+pre_groups  <- c(
+  "the U.S."      = total_over("United States", pre_years),
+  "the EU-27"     = total_over("European Union (27)", pre_years),
+  "the U.K."      = total_over("United Kingdom", pre_years),
+  "Russia"        = total_over("Russia", pre_years),
+  "China"         = total_over("China", pre_years),
+  "India"         = total_over("India", pre_years),
+  "Japan"         = total_over("Japan", pre_years),
+  "Canada"        = total_over("Canada", pre_years),
+  "Africa"        = total_over("Africa", pre_years),
+  "South America" = total_over("South America", pre_years),
+  "the rest of Asia" = total_over("Asia", pre_years) - total_over("China", pre_years) -
+                       total_over("India", pre_years) - total_over("Japan", pre_years)
+) / pre_total
+pre_top <- sort(pre_groups, decreasing = TRUE)[1:3]          # the three largest groups
+pre_top_txt <- paste0(names(pre_top), " (", percent(pre_top, 1), ")")
+intro_line <- sprintf(paste0("The record begins in %d. By %d the world had already emitted %s billion tonnes, ",
+                             "%s of everything emitted to date,\nmostly by %s, %s and %s."),
+                      min(pre_years), Y0, comma(round(pre_total / 1000)), percent(pre_share, 1),
+                      pre_top_txt[1], pre_top_txt[2], pre_top_txt[3])
+intro_line
+
+flags <- tibble(lab = c("CN", "US", "IN"),
+                 col = c(colors[["China"]], colors[["United States"]], colors[["India"]]),
+                 x = c(1952, 1954.3, 1956.6))
+```
+
+### 3.8 The smokestack the stream comes out of
+
+The chimney photo (`chimney.png`, saved next to this file) stands at the left
+edge, with its smoke running straight into the start of the stream in `r Y0`.
+The photo is placed so its plume sits level with the stream's start,
+its base sits on the time axis, and it keeps its own proportions. The stream
+is drawn on top, so the colored bands come out of the smoke.
+
+```{r smokestack}
+chimney_img <- png::readPNG("chimney.png")
+img_ratio <- dim(chimney_img)[1] / dim(chimney_img)[2]   # height / width in pixels
+
+smoke_frac <- 0.18          # the plume's middle, as a share of the photo's height from the top
+stack_H    <- -axis_y / (1 - smoke_frac)                    # photo height in data units
+stack_ymax <- smoke_frac * stack_H
+stack_ymin <- axis_y
+
+# convert the photo's height into a width in years, using the panel's size
+# in inches, so it isn't stretched
+panel_w_in <- 17.0; panel_h_in <- 8.6
+x_range <- (x_max - (Y0 - 7.5)); y_range <- ylim_hi - ylim_lo
+stack_h_in <- stack_H / y_range * panel_h_in
+stack_w    <- (stack_h_in / img_ratio) / panel_w_in * x_range
+stack_xmax <- Y0 + 1.0       # smoke tucks just under the stream's first year
+stack_xmin <- stack_xmax - stack_w
+
+smoke_end <- Y0 + 2          # (used to drop band outlines inside the smoke)
+```
+
+### 3.9 The plot
+
+```{r plot, fig.width=17.5, fig.height=10.2, fig.cap="CO2 emissions through time, by region, 1950-2025, each band labeled with its own totals (Our World in Data)"}
+ggplot(long, aes(x = year, ymin = ymin, ymax = ymax, fill = category)) +
+  # chimney photo, drawn first so the stream sits on top of its smoke
+  annotation_raster(chimney_img, xmin = stack_xmin, xmax = stack_xmax,
+                    ymin = stack_ymin, ymax = stack_ymax, interpolate = TRUE) +
+  # the stream: the same thin cream separators between bands in every year
+  geom_ribbon(color = BG, linewidth = 0.4) +
+  scale_fill_manual(values = colors, guide = "none") +
+  scale_x_continuous(expand = c(0, 0)) +
+
+  # one straight column of names near the right end, each inside its band
+  geom_text(data = filter(name_df, inside),
+            aes(x = name_x, y = y, label = label, color = category, size = fs),
+            inherit.aes = FALSE, family = "sans", fontface = "bold", lineheight = 0.88) +
+  scale_color_manual(values = label_colors, guide = "none") +
+  scale_size_identity() +
+  # the one band too thin to hold its name (Canada) gets it just above its top edge
+  geom_segment(data = sa_pointer, aes(x = x, xend = x, y = y_mid, yend = y_lab - max_total * 0.008),
+               inherit.aes = FALSE, linewidth = 0.6, color = sa_pointer$col) +
+  geom_text(data = sa_pointer, aes(x = x, y = y_lab, label = label),
+            inherit.aes = FALSE, fontface = "bold", size = 4.0, vjust = 0, color = sa_pointer$txt) +
+  geom_text(data = filter(name_df, category == "Canada"),
+            aes(x = name_x, y = ymax + max_total * 0.008, label = label),
+            inherit.aes = FALSE, fontface = "bold", size = 3.4, vjust = 0,
+            color = filter(name_df, category == "Canada")$txt) +
+
+  # call-out annotations, entirely in the cream background
+  annotate("segment", x = ann1$bracket_x[1], xend = ann1$bracket_x[2],
+           y = ann1$bracket_y, yend = ann1$bracket_y, linewidth = 0.5, color = "#2b2b2b") +
+  annotate("segment", x = ann1$bracket_x, xend = ann1$bracket_x,
+           y = ann1$bracket_y - max_total * 0.008, yend = ann1$bracket_y + max_total * 0.008,
+           linewidth = 0.5, color = "#2b2b2b") +
+  annotate("segment", x = ann1$arrow_x, xend = ann1$arrow_x,
+           y = ann1$bracket_y, yend = ann1$arrow_yend, linewidth = 0.5, color = "#2b2b2b",
+           arrow = arrow(length = unit(0.12, "inches"), type = "open")) +
+  annotate("text", x = ann1$x, y = ann1$y, label = ann1$label, hjust = 0, vjust = 1,
+           size = 4.3, family = "sans", color = "#2b2b2b", lineheight = 1.25) +
+  annotate("segment", x = ann2$xstart, y = ann2$ystart, xend = ann2$xend, yend = ann2$yend,
+           linewidth = 0.5, color = "#2b2b2b") +
+  annotate("text", x = ann2$x, y = ann2$y, label = ann2$label, hjust = 0, vjust = 1,
+           size = 4.3, family = "sans", color = "#2b2b2b", lineheight = 1.25) +
+  annotate("text", x = ann3$x, y = ann3$y, label = ann3$label, hjust = 0, vjust = 1,
+           size = 4.3, family = "sans", color = "#2b2b2b", lineheight = 1.25) +
+  geom_point(data = flags, aes(x = x, y = -17500), inherit.aes = FALSE, shape = 16,
+             size = 9, color = flags$col) +
+  geom_text(data = flags, aes(x = x, y = -17500, label = lab), inherit.aes = FALSE,
+            size = 2.6, fontface = "bold", color = "white") +
+
+  # bottom axis, drawn by hand so it can sit below the floating baseline
+  annotate("segment", x = Y0, xend = Y1, y = axis_y, yend = axis_y, linewidth = 0.6,
+           color = "#2b2b2b") +
+  annotate("text", x = axis_ticks, y = axis_y - max_total * 0.018,
+           label = axis_ticks, size = 4.2, vjust = 1, color = "#2b2b2b", family = "sans") +
+
+  # numbers set right against the end of each band, in the band's color
+  geom_text(data = end_df, aes(x = num_v1, y = y, label = number(v1, accuracy = 0.1)),
+            inherit.aes = FALSE, hjust = 0, fontface = "bold", size = 3.4, color = end_df$txt) +
+  geom_text(data = end_df, aes(x = num_v2, y = y, label = number(v2, accuracy = 0.1)),
+            inherit.aes = FALSE, hjust = 0, fontface = "bold", size = 3.4, color = end_df$txt) +
+  annotate("segment", x = div_x, xend = div_x, y = head_y - min_gap * 0.45,
+           yend = min(end_df$y) - min_gap * 0.6, linewidth = 0.3, color = "#cfc8b8") +
+  annotate("text", x = num_v1, y = head_y + min_gap * 1.15,
+           label = "Tonnes of CO\u2082\nin billions", hjust = 0, vjust = 0, size = 3.2,
+           color = "#8a8a8a", lineheight = 0.95, family = "sans") +
+  annotate("text", x = num_v1, y = head_y, label = as.character(Y1), hjust = 0,
+           size = 3.2, color = "#8a8a8a", family = "sans") +
+  annotate("text", x = num_v2, y = head_y, label = paste0(Y0, "\u2013", Y1), hjust = 0,
+           size = 3.2, color = "#8a8a8a", family = "sans") +
+
+  # the line under the title about the years before 1950
+  annotate("text", x = Y0 - 7.3, y = ylim_hi + max_total * 0.055, label = intro_line, hjust = 0, vjust = 1,
+           size = 4.6, family = "serif", color = "#3a3a3a", lineheight = 1.15) +
+  coord_cartesian(clip = "off", xlim = c(Y0 - 7.5, x_max), ylim = c(ylim_lo, ylim_hi)) +
+  labs(title = "CO₂ Emissions Through Time",
+       subtitle = paste0(Y0, "–", Y1)) +
+  theme_void(base_size = 14) +
+  theme(
+    plot.background  = element_rect(fill = BG, color = NA),
+    panel.background = element_rect(fill = BG, color = NA),
+    plot.margin      = margin(16, 18, 10, 18),
+    plot.title    = element_text(face = "bold", size = 30, hjust = 0, family = "serif",
+                                  margin = margin(b = 2)),
+    plot.subtitle = element_text(face = "bold", size = 18, hjust = 0, family = "serif",
+                                  margin = margin(b = 8)),
+    plot.caption  = element_blank()
+  )
+```
+
+### 3.10 Reading the chart
+
+- **Shape**: the stack is centered (a "silhouette" streamgraph), so both the
+  top and bottom edges swell outward over time — the visual read is "the
+  world's carbon footprint widening," not just a line going up.
+- **Labels**: every name sits in one straight vertical column near the
+  right end, inside its own band, with text color chosen by contrast. The
+  position is averaged over a few flat years before the 2020 dip so each
+  name stays inside its band. Canada is too thin to hold text, so its name
+  sits just above its band.
+- **Call-outs**: the three framing sentences, and their leader lines, are
+  positioned only in the blank cream background — never on top of a band —
+  by finding each year's actual top/bottom envelope and placing the text
+  safely outside it.
+- **Time range**: `r Y0`–`r Y1`. The dataset starts in 1750; this chart
+  shows `r Y0` onward, and every region has recorded data for every year in
+  that range. The right-hand totals cover `r Y0`–`r Y1`.
+- **Call-out numbers**: every figure in the three call-outs is computed in
+  section 3.7, not typed in. The first covers the 1950s; the years before
+  1950 are covered by the line under the title. The third names China, the U.S. and India as the
+  three largest single countries (the code checks this), and gives the rest
+  of Asia's share separately. As a group of countries, the rest of Asia
+  emits more than the U.S.
+- **The numbers**: every band ends in `r Y1` with its own figures beside it,
+  in its own color — the `r Y1` total and the `r Y0`–`r Y1` running total, in
+  billions of tonnes. There is no separate table repeating the names: the
+  figures sit right against the end of each band, and the thinnest bands'
+  figures are nudged apart just enough to stay legible. Both numbers are read
+  out of `mat`, the same matrix that draws the stream, so the two can never
+  disagree.
+
+# 4. Artwork for the ear: *Breath of the Chimney*
+
+A chart shows the whole period at once, so a reader can see that emissions
+rose without feeling how quickly. Sound plays out in time, so a listener
+experiences it as it happens. *Breath of the Chimney* compresses 1850–`r last_year`
+into about half a minute. Each year lasts 0.15 seconds. Four layers carry
+the data:
+
+```{r sound-mapping, echo=FALSE}
+tribble(
+  ~Layer,             ~`What you hear`,                                   ~`Data it carries`,
+  "Smoke",            "filtered noise, like a roaring chimney or wind",     "world CO₂ each year → loudness",
+  "Three voices",     "an A-major chord (A3, C♯4, E4)",                      "U.S., EU-27 and China CO₂ → loudness of each note",
+  "Warming drone",    "a low hum that slowly rises in pitch",                "warming from CO₂ → pitch (one octave per 0.5 °C)",
+  "Clock",            "a soft tick",                                         "the start of every decade"
+) %>% kable()
+```
+
+The noise suits emissions because CO₂ is invisible and shapeless: it reads
+as a roar rather than a note. Each emitter's note follows its own history.
+The U.S. note (A3) swells early, the EU-27 note (C♯4) swells and then fades,
+and the China note (E4) is silent until the 1950s before overpowering the
+others. The pitch of the drone is never reset, because warming accumulates
+the same way cumulative emissions do.
+
+## 4.1 Build the score
+
+The score is a table with one row per year. Each column is a layer
+expressed as a share of the loudest year, from 0 to 1.
+
+```{r sound-score}
+son_years <- 1850:last_year
+
+# a country's yearly series on son_years. Years before its first record
+# count as 0; the warming series stops at 2024, so its last value is held.
+yearly <- function(name, var = "co2") {
+  d <- co2 %>% filter(country == name, !is.na(.data[[var]]))
+  v <- approx(d$year, d[[var]], xout = son_years, rule = 2)$y
+  v[son_years < min(d$year)] <- 0
+  v
+}
+
+score <- tibble(
+  year  = son_years,
+  world = yearly("World"),
+  us    = yearly("United States"),
+  eu    = yearly("European Union (27)"),
+  china = yearly("China"),
+  temp  = yearly("World", "temperature_change_from_co2")
+)
+peak <- max(score$world)
+
+score %>%
+  filter(year %in% c(1850, 1900, 1950, 2000, last_year)) %>%
+  mutate(across(c(world, us, eu, china), ~ round(.x / peak, 3)),
+         temp = round(temp, 2)) %>%
+  kable(col.names = c("Year", "Smoke loudness", "U.S. note", "EU-27 note",
+                      "China note", "Warming (°C)"))
+```
+
+```{r sound-score-plot, fig.height=6.5, fig.cap="The score: what each layer of the sound does over time"}
+score_long <- bind_rows(
+  score %>% transmute(year, layer = "1. Smoke loudness (world CO₂)", voice = "World", value = world / peak),
+  score %>% transmute(year, layer = "2. Chord voices (loudness)", voice = "U.S. (A3)", value = us / peak),
+  score %>% transmute(year, layer = "2. Chord voices (loudness)", voice = "EU-27 (C♯4)", value = eu / peak),
+  score %>% transmute(year, layer = "2. Chord voices (loudness)", voice = "China (E4)", value = china / peak),
+  score %>% transmute(year, layer = "3. Drone pitch (Hz)", voice = "Warming", value = 110 * 2^(temp / 0.5))
+)
+voice_colors <- c("World" = "#6e6e6e", "U.S. (A3)" = colors[["United States"]],
+                  "EU-27 (C♯4)" = "#c79a00", "China (E4)" = colors[["China"]],
+                  "Warming" = "#2b2b2b")
+
+ggplot(score_long, aes(year, value, color = voice)) +
+  geom_line(linewidth = 0.9) +
+  facet_wrap(~ layer, ncol = 1, scales = "free_y") +
+  scale_color_manual(values = voice_colors, name = NULL) +
+  scale_x_continuous(breaks = seq(1850, 2025, by = 25)) +
+  labs(x = NULL, y = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank(), legend.position = "top",
+        strip.text = element_text(face = "bold", hjust = 0))
+```
+
+## 4.2 Synthesise the sound
+
+The sound is built sample by sample in base R. A tone is a sine wave, the
+smoke is smoothed random noise, and each layer's loudness follows the score
+smoothly from one year to the next. The result is saved as a standard
+16-bit WAV file, `co2_breath.wav`, with no audio packages required.
+
+```{r sound-synth}
+sr <- 22050                     # samples per second
+sec_per_year <- 0.15
+n <- round(length(son_years) * sec_per_year * sr)
+t_sec <- (0:(n - 1)) / sr
+yr <- son_years[1] + t_sec / sec_per_year           # the year at each sample
+at <- function(v) approx(score$year, v, xout = yr, rule = 2)$y
+
+# 1. smoke: smoothed noise, loudness = world emissions
+set.seed(1)
+noise <- as.numeric(stats::filter(rnorm(n), rep(1 / 12, 12), circular = TRUE))
+smoke <- 0.30 * at(score$world / peak) * noise / sd(noise)
+
+# 2. the chord: one note per emitter, loudness = its emissions
+tone <- function(freq, amp) amp * sin(2 * pi * freq * t_sec)
+voices <- tone(220.00, 0.30 * at(score$us    / peak)) +
+          tone(277.18, 0.30 * at(score$eu    / peak)) +
+          tone(329.63, 0.30 * at(score$china / peak))
+
+# 3. the drone: pitch rises one octave per 0.5 °C of CO₂-driven warming
+f_drone <- 110 * 2^(at(score$temp) / 0.5)
+drone <- 0.05 * sin(2 * pi * cumsum(f_drone) / sr)
+
+# 4. the clock: a short tick at every decade
+tick <- numeric(n)
+for (dec in son_years[son_years %% 10 == 0]) {
+  i0 <- round((dec - son_years[1]) * sec_per_year * sr) + 1
+  k <- 0:round(0.03 * sr)
+  idx <- i0 + k
+  keep <- idx <= n
+  tick[idx[keep]] <- tick[idx[keep]] +
+    0.25 * exp(-k[keep] / (0.006 * sr)) * sin(2 * pi * 1500 * k[keep] / sr)
+}
+
+mix <- smoke + voices + drone + tick
+mix <- mix * pmin(1, t_sec / 0.5, (max(t_sec) - t_sec) / 1.0)   # fade in / out
+mix <- 0.9 * mix / max(abs(mix))
+
+write_wav <- function(x, path, sr) {
+  pcm <- as.integer(round(x * 32767))
+  nbytes <- length(pcm) * 2
+  con <- file(path, "wb"); on.exit(close(con))
+  writeChar("RIFF", con, eos = NULL); writeBin(as.integer(36 + nbytes), con, size = 4, endian = "little")
+  writeChar("WAVEfmt ", con, eos = NULL); writeBin(16L, con, size = 4, endian = "little")
+  writeBin(c(1L, 1L), con, size = 2, endian = "little")                 # PCM, mono
+  writeBin(c(as.integer(sr), as.integer(sr * 2)), con, size = 4, endian = "little")
+  writeBin(c(2L, 16L), con, size = 2, endian = "little")                # block align, bits
+  writeChar("data", con, eos = NULL); writeBin(as.integer(nbytes), con, size = 4, endian = "little")
+  writeBin(pcm, con, size = 2, endian = "little")
+}
+write_wav(mix, "co2_breath.wav", sr)
+
+# how loud is each part of the piece? (root-mean-square level per 25 years)
+tibble(year = floor(yr / 25) * 25, x = mix) %>%
+  group_by(from = year) %>%
+  summarise(loudness_rms = round(sqrt(mean(x^2)), 3)) %>%
+  kable()
+```
+
+## 4.3 Listen
+
+```{r sound-player, echo=FALSE, results="asis"}
+cat(sprintf('<audio controls style="width:100%%" src="data:audio/wav;base64,%s"></audio>',
+            base64enc::base64encode("co2_breath.wav")))
+cat(sprintf("\n\n*%.0f seconds. The decade ticks mark time: one tick every 1.5 seconds.*\n",
+            length(mix) / sr))
+```
+
+What to listen for:
+
+- **1850–1945:** a quiet hiss, with the U.S. and EU-27 notes slowly coming through. The
+  first doubling took `r doubling_of("Industrial take-off")` years, but from a small base, so it is easy to
+  miss.
+- **1946–1973:** the post-war boom. The hiss swells quickly and the U.S. and
+  EU-27 notes ring together.
+- **1980s onward:** the EU-27 note fades, and the China note grows until it
+  is louder than both others (from the mid-2000s). By the end, the roar has drowned out the ticks.
+- **The whole piece:** the drone rises slowly and never comes back down.
+  Warming is the one layer that does not drop when emissions do, because it
+  follows the running total.
+
+# 5. Reflection
+
+## 5.1 Can data art reveal patterns that conventional visualisation cannot?
+
+Partly. Neither artwork shows a fact that the analysis in Part 2 does not
+also contain: the growth rates, the shares and the warming slope are all in
+the tables. But both artworks make some patterns much harder to miss.
+
+- **Composition and growth at once.** In the line chart in section 2.4,
+  total size and composition compete for attention. The streamgraph's
+  centred layout shows both together: the stream widens as emissions grow,
+  and the bands inside it reorder as the U.S. and EU give way to China and
+  the rest of Asia.
+- **Timing.** The sonification makes the listener live through the
+  timeline. A chart shows a hockey-stick curve all at once. Sound makes the
+  listener wait through a century of near silence, then fills the last ten
+  seconds with roar. That makes the point of section 2.4 felt rather than
+  read: in absolute terms, most emissions are recent.
+- **Things that move together or apart.** In the chord, the listener hears
+  the EU-27 note fade while the China note rises. A chart shows the same
+  crossover, but in sound it is heard as one voice taking over from another.
+  The rising drone also makes plain that warming does not drop back when
+  yearly emissions dip, as they did in 2020.
+
+The cost is precision. Nobody can hear "15.5 years" or read 296.3 billion
+tonnes off the width of a band. That is why the streamgraph writes its
+numbers at the end of each band, and why this document keeps the regression
+tables next to the artworks. Data art is a way into the data, not a
+replacement for analysing it.
+
+## 5.2 Is emotional understanding a legitimate form of understanding data?
+
+Yes, with conditions. Understanding includes knowing what matters and why,
+not only knowing the numbers. Someone who can recite that the lowest-emitting
+half of humanity emits `r percent(bottom50, 1)` of the CO₂, but has never
+felt that this is unequal, has not fully understood the number.
+Climate change is a problem about scale, accumulation and fairness. Those
+are exactly the things that numbers alone tend to flatten and that artwork
+can bring back.
+
+Emotional understanding is only legitimate if the feeling is earned
+honestly, and these artworks follow four rules to make sure it is:
+
+1. **The emotion has to come from the data.** Every visual and sonic choice
+   is computed from the CSV. The width of the stream, the loudness of the
+   roar and the pitch of the drone are all data, not decoration.
+2. **The encodings must not exaggerate.** Loudness and band width are both
+   proportional to emissions, with no exaggerated scales and no cherry-picked
+   start years. The early decades are quiet because they really were
+   smaller.
+3. **The limits must be stated.** Sections 2.4, 2.6 and 2.7 explain the
+   autocorrelation in the growth model, the per-country averaging behind the
+   Gini, and the fact that the warming series comes from a model.
+4. **The art should lead back to the analysis.** The artwork makes people
+   care, and the statistics let them check. A feeling that cannot be traced
+   back to the numbers is manipulation, not understanding.
+
+Used this way, data art does not replace analysis. It helps the findings
+reach people who would never read a regression table.
+
+# 6. Summary of findings
+
+- World fossil CO₂ emissions rose from
+  `r round(world$co2[world$year == 1850])` million tonnes in 1850 to
+  `r comma(round(world$co2[world$year == last_year]))` million tonnes in `r last_year`.
+  Growth peaked twice: about
+  `r percent(growth_of("Industrial take-off"), 0.1)` a year in 1850–1913 and
+  `r percent(growth_of("Post-war boom"), 0.1)` a year in 1946–1973.
+- Ten countries account for `r percent(top10_share, 1)` of cumulative
+  emissions since 1750.
+- In `r last_year` the lowest-emitting half of the world's population emitted
+  `r percent(bottom50, 1)` of the CO₂. The Gini coefficient across countries
+  is `r round(gini, 2)`.
+- In this dataset, warming from CO₂ rises by about `r round(per_1000, 2)` °C
+  per 1,000 billion tonnes emitted, in line with the IPCC's estimate.
+
+**Data and files.** The analysis uses Our World in Data, *CO₂ and Greenhouse
+Gas Emissions* (<https://github.com/owid/co2-data>), from the
+`owid-co2-data.csv` in this folder. To knit this document, keep
+`owid-co2-data.csv` and `chimney.png` in the same folder as the `.Rmd`.
+Knitting writes `co2_breath.wav` to that folder.
